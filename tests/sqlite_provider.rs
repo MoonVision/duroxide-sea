@@ -14,7 +14,7 @@ use sea_orm_migration::MigratorTrait;
 async fn sea_provider() -> DuroxideSeaProvider {
     let database_url = format!(
         "sqlite:file:duroxide-sea-{}?mode=memory&cache=shared",
-        uuid::Uuid::new_v4()
+        uuid::Uuid::now_v7()
     );
     let mut options = ConnectOptions::new(database_url);
     options.max_connections(5).sqlx_logging(false);

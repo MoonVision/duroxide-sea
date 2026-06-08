@@ -77,7 +77,7 @@ impl Provider for DuroxideSeaProvider {
                 continue;
             }
 
-            let lock_token = Uuid::new_v4().to_string();
+            let lock_token = Uuid::now_v7().to_string();
             let locked_until = now.saturating_add(duration_ms(lock_timeout));
 
             let lock_result = execute(
@@ -484,7 +484,7 @@ impl Provider for DuroxideSeaProvider {
                 continue;
             }
 
-            let lock_token = Uuid::new_v4().to_string();
+            let lock_token = Uuid::now_v7().to_string();
             let locked_until = now.saturating_add(duration_ms(lock_timeout));
             let changed = execute(
                 &txn,
