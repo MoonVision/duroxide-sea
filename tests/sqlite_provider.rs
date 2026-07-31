@@ -72,6 +72,22 @@ async fn provider_validation_worker_peek_lock_semantics() {
 }
 
 #[tokio::test]
+async fn abandon_work_item_rejects_invalid_tokens() {
+    let provider = provider().await;
+
+    for ignore_attempt in [false, true] {
+        let error = provider
+            .abandon_work_item("unknown-token", None, ignore_attempt)
+            .await
+            .expect_err("invalid token should be rejected");
+        assert_eq!(
+            (error.operation.as_str(), error.is_retryable()),
+            ("abandon_work_item", false)
+        );
+    }
+}
+
+#[tokio::test]
 async fn provider_validation_instance_creation_via_metadata() {
     test_instance_creation_via_metadata(&SeaSqliteFactory).await;
 }

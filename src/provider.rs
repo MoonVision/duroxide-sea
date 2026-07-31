@@ -704,7 +704,7 @@ impl Provider for DuroxideSeaProvider {
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
         let visible_at = now_ms().saturating_add(delay.map_or(0, duration_ms));
-        if ignore_attempt {
+        let changed = if ignore_attempt {
             execute(
                 &self.db,
                 "UPDATE duroxide_worker_queue
@@ -714,7 +714,7 @@ impl Provider for DuroxideSeaProvider {
                 vec![v_i64(visible_at), v_str(token)],
                 "abandon_work_item",
             )
-            .await?;
+            .await?
         } else {
             execute(
                 &self.db,
@@ -724,8 +724,16 @@ impl Provider for DuroxideSeaProvider {
                 vec![v_i64(visible_at), v_str(token)],
                 "abandon_work_item",
             )
-            .await?;
+            .await?
+        };
+
+        if changed == 0 {
+            return Err(ProviderError::permanent(
+                "abandon_work_item",
+                "Invalid lock token or already acked",
+            ));
         }
+
         Ok(())
     }
 
