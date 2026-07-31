@@ -12,7 +12,7 @@ replay-version-test = ["duroxide/replay-version-test"]
 
 [dependencies]
 async-trait = "0.1.89"
-duroxide = "0.1.29"
+duroxide = "0.1.30"
 sea-orm = { version = "1.1.20", features = [
     "sqlx-sqlite",
     "sqlx-postgres",
@@ -25,5 +25,5 @@ serde_json = "1"
 uuid = { version = "1.23.0", features = ["v7"] }
 
 [dev-dependencies]
-duroxide = { version = "0.1.29", features = ["provider-test"] }
+duroxide = { version = "0.1.30", features = ["provider-test"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }

@@ -48,6 +48,7 @@ fn start_item(instance: &str) -> WorkItem {
         version: Some("1.0.0".to_string()),
         parent_instance: None,
         parent_id: None,
+        parent_execution_id: None,
         execution_id: INITIAL_EXECUTION_ID,
     }
 }
@@ -87,6 +88,7 @@ async fn appends_and_reads_history() {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             carry_forward_events: None,
             initial_custom_status: None,
         },
@@ -135,6 +137,7 @@ async fn fetches_and_acks_orchestration_item() {
             input: "{}".to_string(),
             parent_instance: None,
             parent_id: None,
+            parent_execution_id: None,
             carry_forward_events: None,
             initial_custom_status: None,
         },
@@ -193,6 +196,7 @@ async fn fetches_and_acks_worker_item_with_completion() {
                     input: "{}".to_string(),
                     parent_instance: None,
                     parent_id: None,
+                    parent_execution_id: None,
                     carry_forward_events: None,
                     initial_custom_status: None,
                 },
