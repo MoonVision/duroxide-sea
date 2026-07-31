@@ -305,7 +305,7 @@ impl Provider for DuroxideSeaProvider {
         kv_store::apply_events(
             &txn,
             &instance_id,
-            &history_delta,
+            history_delta,
             metadata.status.as_deref(),
         )
         .await?;
@@ -1493,7 +1493,11 @@ fn duration_ms(duration: Duration) -> i64 {
 }
 
 pub(crate) fn v_str(value: impl AsRef<str>) -> Value {
-    Value::String(Some(Box::new(value.as_ref().to_string())))
+    v_owned_str(value.as_ref().to_string())
+}
+
+pub(crate) fn v_owned_str(value: String) -> Value {
+    Value::String(Some(Box::new(value)))
 }
 
 pub(crate) fn v_opt_str(value: Option<&str>) -> Value {

@@ -3,25 +3,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use duroxide::providers::{KvEntry, ProviderError};
 use duroxide::{Event, EventKind};
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, DatabaseBackend};
 
 use crate::provider::{
-    execute, get, get_opt, query_all, query_one, v_i64, v_opt_str, v_str, v_u64,
+    execute, get, get_opt, query_all, query_one, v_i64, v_opt_str, v_owned_str, v_str, v_u64,
 };
 
 pub(crate) async fn apply_events<C: ConnectionTrait>(
     conn: &C,
     instance_id: &str,
-    history_delta: &[Event],
+    history_delta: Vec<Event>,
     execution_status: Option<&str>,
 ) -> Result<(), ProviderError> {
     for event in history_delta {
-        match &event.kind {
+        match event.kind {
             EventKind::KeyValueSet {
                 key,
                 value,
                 last_updated_at_ms,
-            } => set_delta(conn, instance_id, key, value, *last_updated_at_ms).await?,
+            } => set_delta(conn, instance_id, key, value, last_updated_at_ms).await?,
             EventKind::KeyValueCleared { key } => {
                 clear_delta_key(conn, instance_id, key).await?;
             }
@@ -48,7 +48,7 @@ pub(crate) async fn snapshot<C: ConnectionTrait>(
         "fetch_orchestration_item",
     )
     .await?;
-    let mut snapshot = HashMap::new();
+    let mut snapshot = HashMap::with_capacity(rows.len());
     for row in rows {
         let key: String = get(&row, "key", "fetch_orchestration_item")?;
         let value: String = get(&row, "value", "fetch_orchestration_item")?;
@@ -69,64 +69,56 @@ pub(crate) async fn get_value<C: ConnectionTrait>(
     instance_id: &str,
     key: &str,
 ) -> Result<Option<String>, ProviderError> {
-    let delta_row = query_one(
+    let row = query_one(
         conn,
-        "SELECT value FROM duroxide_kv_delta WHERE instance_id = ? AND key = ?",
+        "WITH input(instance_id, key) AS (SELECT ?, ?)
+         SELECT CASE
+                    WHEN delta.key IS NOT NULL THEN delta.value
+                    ELSE store.value
+                END AS value
+         FROM input
+         LEFT JOIN duroxide_kv_delta AS delta
+           ON delta.instance_id = input.instance_id AND delta.key = input.key
+         LEFT JOIN duroxide_kv_store AS store
+           ON store.instance_id = input.instance_id AND store.key = input.key",
         vec![v_str(instance_id), v_str(key)],
         "get_kv_value",
     )
-    .await?;
-    if let Some(row) = delta_row {
-        return get_opt(&row, "value", "get_kv_value");
-    }
-
-    let store_row = query_one(
-        conn,
-        "SELECT value FROM duroxide_kv_store WHERE instance_id = ? AND key = ?",
-        vec![v_str(instance_id), v_str(key)],
-        "get_kv_value",
-    )
-    .await?;
-    store_row
-        .map(|row| get(&row, "value", "get_kv_value"))
-        .transpose()
+    .await?
+    .ok_or_else(|| ProviderError::permanent("get_kv_value", "Missing merged value row"))?;
+    get_opt(&row, "value", "get_kv_value")
 }
 
 pub(crate) async fn get_all_values<C: ConnectionTrait>(
     conn: &C,
     instance_id: &str,
 ) -> Result<HashMap<String, String>, ProviderError> {
-    let store_rows = query_all(
+    let rows = query_all(
         conn,
-        "SELECT key, value FROM duroxide_kv_store WHERE instance_id = ?",
+        "WITH input(instance_id) AS (SELECT ?)
+         SELECT store.key, store.value
+         FROM duroxide_kv_store AS store
+         JOIN input ON input.instance_id = store.instance_id
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM duroxide_kv_delta AS delta
+             WHERE delta.instance_id = store.instance_id AND delta.key = store.key
+         )
+         UNION ALL
+         SELECT delta.key, delta.value
+         FROM duroxide_kv_delta AS delta
+         JOIN input ON input.instance_id = delta.instance_id
+         WHERE delta.value IS NOT NULL",
         vec![v_str(instance_id)],
         "get_kv_all_values",
     )
     .await?;
-    let mut values = HashMap::new();
-    for row in store_rows {
+    let mut values = HashMap::with_capacity(rows.len());
+    for row in rows {
         let key: String = get(&row, "key", "get_kv_all_values")?;
         let value: String = get(&row, "value", "get_kv_all_values")?;
         values.insert(key, value);
     }
-
-    let delta_rows = query_all(
-        conn,
-        "SELECT key, value FROM duroxide_kv_delta WHERE instance_id = ?",
-        vec![v_str(instance_id)],
-        "get_kv_all_values",
-    )
-    .await?;
-    for row in delta_rows {
-        let key: String = get(&row, "key", "get_kv_all_values")?;
-        let value: Option<String> = get_opt(&row, "value", "get_kv_all_values")?;
-        if let Some(value) = value {
-            values.insert(key, value);
-        } else {
-            values.remove(&key);
-        }
-    }
-
     Ok(values)
 }
 
@@ -134,17 +126,46 @@ pub(crate) async fn stats<C: ConnectionTrait>(
     conn: &C,
     instance_id: &str,
 ) -> Result<(u64, u64), ProviderError> {
-    let values = get_all_values(conn, instance_id).await?;
-    let count = values.len() as u64;
-    let value_bytes = values.values().map(String::len).sum::<usize>() as u64;
-    Ok((count, value_bytes))
+    let value_length = match conn.get_database_backend() {
+        DatabaseBackend::Sqlite => "LENGTH(CAST(value AS BLOB))",
+        DatabaseBackend::Postgres | DatabaseBackend::MySql => "OCTET_LENGTH(value)",
+    };
+    let sql = format!(
+        "WITH input(instance_id) AS (SELECT ?),
+         effective_values(value) AS (
+             SELECT store.value
+             FROM duroxide_kv_store AS store
+             JOIN input ON input.instance_id = store.instance_id
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM duroxide_kv_delta AS delta
+                 WHERE delta.instance_id = store.instance_id AND delta.key = store.key
+             )
+             UNION ALL
+             SELECT delta.value
+             FROM duroxide_kv_delta AS delta
+             JOIN input ON input.instance_id = delta.instance_id
+             WHERE delta.value IS NOT NULL
+         )
+         SELECT COUNT(*) AS key_count,
+                COALESCE(SUM({value_length}), 0) AS value_bytes
+         FROM effective_values"
+    );
+    let row = query_one(conn, &sql, vec![v_str(instance_id)], "get_instance_stats")
+        .await?
+        .ok_or_else(|| {
+            ProviderError::permanent("get_instance_stats", "Missing KV aggregate row")
+        })?;
+    let count: i64 = get(&row, "key_count", "get_instance_stats")?;
+    let value_bytes: i64 = get(&row, "value_bytes", "get_instance_stats")?;
+    Ok((count as u64, value_bytes as u64))
 }
 
 async fn set_delta<C: ConnectionTrait>(
     conn: &C,
     instance_id: &str,
-    key: &str,
-    value: &str,
+    key: String,
+    value: String,
     last_updated_at_ms: u64,
 ) -> Result<(), ProviderError> {
     execute(
@@ -155,8 +176,8 @@ async fn set_delta<C: ConnectionTrait>(
          SET value = excluded.value, last_updated_at_ms = excluded.last_updated_at_ms",
         vec![
             v_str(instance_id),
-            v_str(key),
-            v_str(value),
+            v_owned_str(key),
+            v_owned_str(value),
             v_u64(last_updated_at_ms),
         ],
         "ack_orchestration_item",
@@ -168,7 +189,7 @@ async fn set_delta<C: ConnectionTrait>(
 async fn clear_delta_key<C: ConnectionTrait>(
     conn: &C,
     instance_id: &str,
-    key: &str,
+    key: String,
 ) -> Result<(), ProviderError> {
     execute(
         conn,
@@ -178,7 +199,7 @@ async fn clear_delta_key<C: ConnectionTrait>(
          SET value = excluded.value, last_updated_at_ms = excluded.last_updated_at_ms",
         vec![
             v_str(instance_id),
-            v_str(key),
+            v_owned_str(key),
             v_opt_str(None),
             v_i64(now_ms()),
         ],
