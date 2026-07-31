@@ -6,7 +6,7 @@ use duroxide::providers::{
     DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderError,
     ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
-use duroxide::{Event, EventKind, SystemStats};
+use duroxide::{Event, EventKind, INITIAL_EVENT_ID, SystemStats};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, QueryResult,
     Statement, TransactionTrait, Value,
@@ -826,25 +826,46 @@ impl Provider for DuroxideSeaProvider {
         .await?
         .ok_or_else(|| ProviderError::permanent("get_instance_stats", "Missing aggregate row"))?;
         let (kv_user_key_count, kv_total_value_bytes) = kv_store::stats(&self.db, instance).await?;
-        let queue_row = query_one(
+        let carry_forward_row = query_one(
             &self.db,
-            "SELECT COUNT(*) AS queue_count
-             FROM duroxide_orchestrator_queue
-             WHERE instance_id = ?",
-            vec![v_str(instance)],
+            "SELECT event_data
+             FROM duroxide_history
+             WHERE instance_id = ? AND execution_id = ? AND event_id = ?",
+            vec![
+                v_str(instance),
+                v_u64(execution_id),
+                v_u64(INITIAL_EVENT_ID),
+            ],
             "get_instance_stats",
         )
-        .await?
-        .ok_or_else(|| ProviderError::permanent("get_instance_stats", "Missing aggregate row"))?;
+        .await?;
 
         let history_event_count: i64 = get(&history_row, "event_count", "get_instance_stats")?;
         let history_size_bytes: i64 = get(&history_row, "history_size", "get_instance_stats")?;
-        let queue_pending_count: i64 = get(&queue_row, "queue_count", "get_instance_stats")?;
+        let queue_pending_count = carry_forward_row
+            .map(|row| {
+                let event_data: String = get(&row, "event_data", "get_instance_stats")?;
+                let event: Event = serde_json::from_str(&event_data).map_err(|e| {
+                    ProviderError::permanent(
+                        "get_instance_stats",
+                        format!("Failed to deserialize OrchestrationStarted event: {e}"),
+                    )
+                })?;
+                Ok::<u64, ProviderError>(match event.kind {
+                    EventKind::OrchestrationStarted {
+                        carry_forward_events: Some(events),
+                        ..
+                    } => events.len() as u64,
+                    _ => 0,
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
 
         Ok(Some(SystemStats {
             history_event_count: history_event_count as u64,
             history_size_bytes: history_size_bytes as u64,
-            queue_pending_count: queue_pending_count as u64,
+            queue_pending_count,
             kv_user_key_count,
             kv_total_value_bytes,
         }))

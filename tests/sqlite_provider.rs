@@ -9,9 +9,9 @@ use duroxide::provider_validations::{
         test_kv_delta_snapshot_includes_completed_execution,
         test_kv_delta_tombstone_overrides_store,
     },
-    test_get_instance_stats_kv_delta_only, test_get_instance_stats_kv_merged,
-    test_instance_creation_via_metadata, test_worker_item_immediate_visibility,
-    test_worker_peek_lock_semantics,
+    test_get_instance_stats_carry_forward, test_get_instance_stats_kv_delta_only,
+    test_get_instance_stats_kv_merged, test_instance_creation_via_metadata,
+    test_worker_item_immediate_visibility, test_worker_peek_lock_semantics,
 };
 use duroxide::providers::{ExecutionMetadata, Provider, WorkItem};
 use duroxide::{Event, EventKind, INITIAL_EXECUTION_ID};
@@ -109,6 +109,11 @@ async fn provider_validation_kv_stats_include_delta_only_values() {
 #[tokio::test]
 async fn provider_validation_kv_stats_merge_store_and_delta() {
     test_get_instance_stats_kv_merged(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_stats_count_carry_forward_events() {
+    test_get_instance_stats_carry_forward(&SeaSqliteFactory).await;
 }
 
 #[tokio::test]
