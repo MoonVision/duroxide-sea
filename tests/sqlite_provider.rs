@@ -1,52 +1,11 @@
-use std::sync::Arc;
 use std::time::Duration;
 
-use duroxide::provider_validations::{
-    ProviderFactory,
-    kv_store::{
-        test_kv_delta_clear_all_tombstones_store, test_kv_delta_client_reads_merged,
-        test_kv_delta_snapshot_excludes_current_execution,
-        test_kv_delta_snapshot_includes_completed_execution,
-        test_kv_delta_tombstone_overrides_store,
-    },
-    test_get_instance_stats_carry_forward, test_get_instance_stats_kv_delta_only,
-    test_get_instance_stats_kv_merged, test_instance_creation_via_metadata,
-    test_worker_item_immediate_visibility, test_worker_peek_lock_semantics,
-};
 use duroxide::providers::{ExecutionMetadata, Provider, WorkItem};
 use duroxide::{Event, EventKind, INITIAL_EXECUTION_ID};
-use duroxide_sea::{DuroxideSeaProvider, migration::Migrator};
-use sea_orm::{ConnectOptions, Database};
-use sea_orm_migration::MigratorTrait;
 
-async fn sea_provider() -> DuroxideSeaProvider {
-    let database_url = format!(
-        "sqlite:file:duroxide-sea-{}?mode=memory&cache=shared",
-        uuid::Uuid::now_v7()
-    );
-    let mut options = ConnectOptions::new(database_url);
-    options.max_connections(5).sqlx_logging(false);
-    let db = Database::connect(options).await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    DuroxideSeaProvider::new(db)
-}
+mod support;
 
-async fn provider() -> Arc<DuroxideSeaProvider> {
-    Arc::new(sea_provider().await)
-}
-
-struct SeaSqliteFactory;
-
-#[async_trait::async_trait]
-impl ProviderFactory for SeaSqliteFactory {
-    async fn create_provider(&self) -> Arc<dyn Provider> {
-        Arc::new(sea_provider().await)
-    }
-
-    fn lock_timeout(&self) -> Duration {
-        Duration::from_secs(1)
-    }
-}
+use support::sqlite_provider as provider;
 
 fn start_item(instance: &str) -> WorkItem {
     WorkItem::StartOrchestration {
@@ -81,16 +40,6 @@ fn orchestration_started_event(instance: &str) -> Event {
 }
 
 #[tokio::test]
-async fn provider_validation_worker_item_immediate_visibility() {
-    test_worker_item_immediate_visibility(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_worker_peek_lock_semantics() {
-    test_worker_peek_lock_semantics(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
 async fn abandon_work_item_rejects_invalid_tokens() {
     let provider = provider().await;
 
@@ -104,51 +53,6 @@ async fn abandon_work_item_rejects_invalid_tokens() {
             ("abandon_work_item", false)
         );
     }
-}
-
-#[tokio::test]
-async fn provider_validation_instance_creation_via_metadata() {
-    test_instance_creation_via_metadata(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_snapshot_excludes_current_execution_delta() {
-    test_kv_delta_snapshot_excludes_current_execution(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_snapshot_includes_completed_execution() {
-    test_kv_delta_snapshot_includes_completed_execution(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_client_reads_merged_state() {
-    test_kv_delta_client_reads_merged(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_tombstone_overrides_stored_value() {
-    test_kv_delta_tombstone_overrides_store(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_clear_all_tombstones_stored_values() {
-    test_kv_delta_clear_all_tombstones_store(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_stats_include_delta_only_values() {
-    test_get_instance_stats_kv_delta_only(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_kv_stats_merge_store_and_delta() {
-    test_get_instance_stats_kv_merged(&SeaSqliteFactory).await;
-}
-
-#[tokio::test]
-async fn provider_validation_stats_count_carry_forward_events() {
-    test_get_instance_stats_carry_forward(&SeaSqliteFactory).await;
 }
 
 #[tokio::test]
