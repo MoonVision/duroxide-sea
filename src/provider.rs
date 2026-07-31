@@ -295,7 +295,7 @@ impl Provider for DuroxideSeaProvider {
             "ack_orchestration_item",
         )
         .await?
-        .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid or expired lock token"))?;
+        .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token or expired lock"))?;
         let instance_id: String = get(&lock_row, "instance_id", "ack_orchestration_item")?;
 
         ensure_instance_and_execution_on(&txn, &instance_id, execution_id, &metadata).await?;
@@ -366,29 +366,23 @@ impl Provider for DuroxideSeaProvider {
             .await
             .map_err(|e| db_error("abandon_orchestration_item", e))?;
         let visible_at = now_ms().saturating_add(delay.map_or(0, duration_ms));
-
-        let changed = if ignore_attempt {
-            execute(
-                &txn,
-                "UPDATE duroxide_orchestrator_queue
-                 SET lock_token = NULL, locked_until = NULL, visible_at = ?,
-                     attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
-                 WHERE lock_token = ?",
-                vec![v_i64(visible_at), v_str(lock_token)],
-                "abandon_orchestration_item",
-            )
-            .await?
+        let sql = if ignore_attempt {
+            "UPDATE duroxide_orchestrator_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?,
+                 attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
+             WHERE lock_token = ?"
         } else {
-            execute(
-                &txn,
-                "UPDATE duroxide_orchestrator_queue
-                 SET lock_token = NULL, locked_until = NULL, visible_at = ?
-                 WHERE lock_token = ?",
-                vec![v_i64(visible_at), v_str(lock_token)],
-                "abandon_orchestration_item",
-            )
-            .await?
+            "UPDATE duroxide_orchestrator_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?
+             WHERE lock_token = ?"
         };
+        let changed = execute(
+            &txn,
+            sql,
+            vec![v_i64(visible_at), v_str(lock_token)],
+            "abandon_orchestration_item",
+        )
+        .await?;
 
         execute(
             &txn,
@@ -557,18 +551,7 @@ impl Provider for DuroxideSeaProvider {
             .await
             .map_err(|e| db_error("ack_work_item", e))?;
         let now = now_ms();
-        let row = query_one(
-            &txn,
-            "SELECT session_id FROM duroxide_worker_queue WHERE lock_token = ? AND locked_until > ?",
-            vec![v_str(token), v_i64(now)],
-            "ack_work_item",
-        )
-        .await?;
-        let session_id: Option<String> = row
-            .as_ref()
-            .map(|row| get_opt::<String>(row, "session_id", "ack_work_item"))
-            .transpose()?
-            .flatten();
+        let session_id = active_work_item_session_id_on(&txn, token, now, "ack_work_item").await?;
 
         let deleted = execute(
             &txn,
@@ -610,18 +593,8 @@ impl Provider for DuroxideSeaProvider {
             .await
             .map_err(|e| db_error("renew_work_item_lock", e))?;
         let now = now_ms();
-        let row = query_one(
-            &txn,
-            "SELECT session_id FROM duroxide_worker_queue WHERE lock_token = ? AND locked_until > ?",
-            vec![v_str(token), v_i64(now)],
-            "renew_work_item_lock",
-        )
-        .await?;
-        let session_id: Option<String> = row
-            .as_ref()
-            .map(|row| get_opt::<String>(row, "session_id", "renew_work_item_lock"))
-            .transpose()?
-            .flatten();
+        let session_id =
+            active_work_item_session_id_on(&txn, token, now, "renew_work_item_lock").await?;
         let changed = execute(
             &txn,
             "UPDATE duroxide_worker_queue SET locked_until = ? WHERE lock_token = ? AND locked_until > ?",
@@ -704,28 +677,23 @@ impl Provider for DuroxideSeaProvider {
         ignore_attempt: bool,
     ) -> Result<(), ProviderError> {
         let visible_at = now_ms().saturating_add(delay.map_or(0, duration_ms));
-        let changed = if ignore_attempt {
-            execute(
-                &self.db,
-                "UPDATE duroxide_worker_queue
-                 SET lock_token = NULL, locked_until = NULL, visible_at = ?,
-                     attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
-                 WHERE lock_token = ?",
-                vec![v_i64(visible_at), v_str(token)],
-                "abandon_work_item",
-            )
-            .await?
+        let sql = if ignore_attempt {
+            "UPDATE duroxide_worker_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?,
+                 attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
+             WHERE lock_token = ?"
         } else {
-            execute(
-                &self.db,
-                "UPDATE duroxide_worker_queue
-                 SET lock_token = NULL, locked_until = NULL, visible_at = ?
-                 WHERE lock_token = ?",
-                vec![v_i64(visible_at), v_str(token)],
-                "abandon_work_item",
-            )
-            .await?
+            "UPDATE duroxide_worker_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?
+             WHERE lock_token = ?"
         };
+        let changed = execute(
+            &self.db,
+            sql,
+            vec![v_i64(visible_at), v_str(token)],
+            "abandon_work_item",
+        )
+        .await?;
 
         if changed == 0 {
             return Err(ProviderError::permanent(
@@ -1299,6 +1267,25 @@ async fn touch_session_on<C: ConnectionTrait>(
     )
     .await?;
     Ok(())
+}
+
+async fn active_work_item_session_id_on<C: ConnectionTrait>(
+    conn: &C,
+    token: &str,
+    now: i64,
+    operation: &'static str,
+) -> Result<Option<String>, ProviderError> {
+    let Some(row) = query_one(
+        conn,
+        "SELECT session_id FROM duroxide_worker_queue WHERE lock_token = ? AND locked_until > ?",
+        vec![v_str(token), v_i64(now)],
+        operation,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    get_opt(&row, "session_id", operation)
 }
 
 fn start_metadata_from_messages(messages: &[WorkItem]) -> Option<(String, Option<String>, u64)> {

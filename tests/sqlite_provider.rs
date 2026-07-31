@@ -61,6 +61,25 @@ fn start_item(instance: &str) -> WorkItem {
     }
 }
 
+fn orchestration_started_event(instance: &str) -> Event {
+    Event::with_event_id(
+        1,
+        instance,
+        INITIAL_EXECUTION_ID,
+        None,
+        EventKind::OrchestrationStarted {
+            name: "TestWorkflow".to_string(),
+            version: "1.0.0".to_string(),
+            input: "{}".to_string(),
+            parent_instance: None,
+            parent_id: None,
+            parent_execution_id: None,
+            carry_forward_events: None,
+            initial_custom_status: None,
+        },
+    )
+}
+
 #[tokio::test]
 async fn provider_validation_worker_item_immediate_visibility() {
     test_worker_item_immediate_visibility(&SeaSqliteFactory).await;
@@ -141,22 +160,7 @@ async fn runs_migrations_and_constructs_provider() {
 #[tokio::test]
 async fn appends_and_reads_history() {
     let provider = provider().await;
-    let event = Event::with_event_id(
-        1,
-        "history-instance",
-        INITIAL_EXECUTION_ID,
-        None,
-        EventKind::OrchestrationStarted {
-            name: "TestWorkflow".to_string(),
-            version: "1.0.0".to_string(),
-            input: "{}".to_string(),
-            parent_instance: None,
-            parent_id: None,
-            parent_execution_id: None,
-            carry_forward_events: None,
-            initial_custom_status: None,
-        },
-    );
+    let event = orchestration_started_event("history-instance");
 
     provider
         .append_with_execution(
@@ -190,22 +194,7 @@ async fn fetches_and_acks_orchestration_item() {
     assert_eq!(item.instance, "orch-instance");
     assert_eq!(attempts, 1);
 
-    let event = Event::with_event_id(
-        1,
-        "orch-instance",
-        INITIAL_EXECUTION_ID,
-        None,
-        EventKind::OrchestrationStarted {
-            name: "TestWorkflow".to_string(),
-            version: "1.0.0".to_string(),
-            input: "{}".to_string(),
-            parent_instance: None,
-            parent_id: None,
-            parent_execution_id: None,
-            carry_forward_events: None,
-            initial_custom_status: None,
-        },
-    );
+    let event = orchestration_started_event("orch-instance");
 
     provider
         .ack_orchestration_item(
@@ -249,22 +238,7 @@ async fn fetches_and_acks_worker_item_with_completion() {
         .ack_orchestration_item(
             &start_token,
             INITIAL_EXECUTION_ID,
-            vec![Event::with_event_id(
-                1,
-                "worker-instance",
-                INITIAL_EXECUTION_ID,
-                None,
-                EventKind::OrchestrationStarted {
-                    name: "TestWorkflow".to_string(),
-                    version: "1.0.0".to_string(),
-                    input: "{}".to_string(),
-                    parent_instance: None,
-                    parent_id: None,
-                    parent_execution_id: None,
-                    carry_forward_events: None,
-                    initial_custom_status: None,
-                },
-            )],
+            vec![orchestration_started_event("worker-instance")],
             vec![],
             vec![],
             ExecutionMetadata {
