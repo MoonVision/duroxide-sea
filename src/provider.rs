@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use duroxide::providers::{
-    DispatcherCapabilityFilter, ExecutionMetadata, KvEntry, OrchestrationItem, Provider,
-    ProviderError, ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
+    DispatcherCapabilityFilter, ExecutionMetadata, OrchestrationItem, Provider, ProviderError,
+    ScheduledActivityIdentifier, SessionFetchConfig, TagFilter, WorkItem,
 };
 use duroxide::{Event, EventKind, SystemStats};
 use sea_orm::{
@@ -12,6 +12,8 @@ use sea_orm::{
     Statement, TransactionTrait, Value,
 };
 use uuid::Uuid;
+
+use crate::kv_store;
 
 #[derive(Clone)]
 pub struct DuroxideSeaProvider {
@@ -241,7 +243,7 @@ impl Provider for DuroxideSeaProvider {
                     return Ok(None);
                 };
 
-            let kv_snapshot = kv_snapshot_on(&txn, &instance_id).await?;
+            let kv_snapshot = kv_store::snapshot(&txn, &instance_id).await?;
 
             txn.commit()
                 .await
@@ -300,7 +302,13 @@ impl Provider for DuroxideSeaProvider {
         append_history_on(&txn, &instance_id, execution_id, &history_delta).await?;
         apply_metadata_on(&txn, &instance_id, execution_id, &metadata).await?;
         apply_custom_status_on(&txn, &instance_id, &history_delta).await?;
-        apply_kv_events_on(&txn, &instance_id, execution_id, &history_delta).await?;
+        kv_store::apply_events(
+            &txn,
+            &instance_id,
+            &history_delta,
+            metadata.status.as_deref(),
+        )
+        .await?;
 
         for item in worker_items {
             enqueue_worker_on(&txn, item).await?;
@@ -788,35 +796,14 @@ impl Provider for DuroxideSeaProvider {
         instance: &str,
         key: &str,
     ) -> Result<Option<String>, ProviderError> {
-        let row = query_one(
-            &self.db,
-            "SELECT value FROM duroxide_kv_store WHERE instance_id = ? AND key = ?",
-            vec![v_str(instance), v_str(key)],
-            "get_kv_value",
-        )
-        .await?;
-        row.map(|row| get(&row, "value", "get_kv_value"))
-            .transpose()
+        kv_store::get_value(&self.db, instance, key).await
     }
 
     async fn get_kv_all_values(
         &self,
         instance: &str,
     ) -> Result<HashMap<String, String>, ProviderError> {
-        let rows = query_all(
-            &self.db,
-            "SELECT key, value FROM duroxide_kv_store WHERE instance_id = ?",
-            vec![v_str(instance)],
-            "get_kv_all_values",
-        )
-        .await?;
-        let mut values = HashMap::new();
-        for row in rows {
-            let key: String = get(&row, "key", "get_kv_all_values")?;
-            let value: String = get(&row, "value", "get_kv_all_values")?;
-            values.insert(key, value);
-        }
-        Ok(values)
+        kv_store::get_all_values(&self.db, instance).await
     }
 
     async fn get_instance_stats(
@@ -838,16 +825,7 @@ impl Provider for DuroxideSeaProvider {
         )
         .await?
         .ok_or_else(|| ProviderError::permanent("get_instance_stats", "Missing aggregate row"))?;
-        let kv_row = query_one(
-            &self.db,
-            "SELECT COUNT(*) AS kv_count, COALESCE(SUM(LENGTH(value)), 0) AS kv_size
-             FROM duroxide_kv_store
-             WHERE instance_id = ?",
-            vec![v_str(instance)],
-            "get_instance_stats",
-        )
-        .await?
-        .ok_or_else(|| ProviderError::permanent("get_instance_stats", "Missing aggregate row"))?;
+        let (kv_user_key_count, kv_total_value_bytes) = kv_store::stats(&self.db, instance).await?;
         let queue_row = query_one(
             &self.db,
             "SELECT COUNT(*) AS queue_count
@@ -861,16 +839,14 @@ impl Provider for DuroxideSeaProvider {
 
         let history_event_count: i64 = get(&history_row, "event_count", "get_instance_stats")?;
         let history_size_bytes: i64 = get(&history_row, "history_size", "get_instance_stats")?;
-        let kv_user_key_count: i64 = get(&kv_row, "kv_count", "get_instance_stats")?;
-        let kv_total_value_bytes: i64 = get(&kv_row, "kv_size", "get_instance_stats")?;
         let queue_pending_count: i64 = get(&queue_row, "queue_count", "get_instance_stats")?;
 
         Ok(Some(SystemStats {
             history_event_count: history_event_count as u64,
             history_size_bytes: history_size_bytes as u64,
             queue_pending_count: queue_pending_count as u64,
-            kv_user_key_count: kv_user_key_count as u64,
-            kv_total_value_bytes: kv_total_value_bytes as u64,
+            kv_user_key_count,
+            kv_total_value_bytes,
         }))
     }
 }
@@ -1065,63 +1041,6 @@ async fn apply_custom_status_on<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn apply_kv_events_on<C: ConnectionTrait>(
-    conn: &C,
-    instance_id: &str,
-    execution_id: u64,
-    history_delta: &[Event],
-) -> Result<(), ProviderError> {
-    for event in history_delta {
-        match &event.kind {
-            EventKind::KeyValueSet {
-                key,
-                value,
-                last_updated_at_ms,
-            } => {
-                execute(
-                    conn,
-                    "INSERT INTO duroxide_kv_store
-                     (instance_id, key, value, execution_id, last_updated_at_ms)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT(instance_id, key) DO UPDATE
-                     SET value = excluded.value,
-                         execution_id = excluded.execution_id,
-                         last_updated_at_ms = excluded.last_updated_at_ms",
-                    vec![
-                        v_str(instance_id),
-                        v_str(key),
-                        v_str(value),
-                        v_u64(execution_id),
-                        v_u64(*last_updated_at_ms),
-                    ],
-                    "ack_orchestration_item",
-                )
-                .await?;
-            }
-            EventKind::KeyValueCleared { key } => {
-                execute(
-                    conn,
-                    "DELETE FROM duroxide_kv_store WHERE instance_id = ? AND key = ?",
-                    vec![v_str(instance_id), v_str(key)],
-                    "ack_orchestration_item",
-                )
-                .await?;
-            }
-            EventKind::KeyValuesCleared => {
-                execute(
-                    conn,
-                    "DELETE FROM duroxide_kv_store WHERE instance_id = ?",
-                    vec![v_str(instance_id)],
-                    "ack_orchestration_item",
-                )
-                .await?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 async fn enqueue_worker_on<C: ConnectionTrait>(
     conn: &C,
     item: WorkItem,
@@ -1267,33 +1186,6 @@ async fn read_history_on<C: ConnectionTrait>(
     Ok(events)
 }
 
-async fn kv_snapshot_on<C: ConnectionTrait>(
-    conn: &C,
-    instance_id: &str,
-) -> Result<HashMap<String, KvEntry>, ProviderError> {
-    let rows = query_all(
-        conn,
-        "SELECT key, value, last_updated_at_ms FROM duroxide_kv_store WHERE instance_id = ?",
-        vec![v_str(instance_id)],
-        "fetch_orchestration_item",
-    )
-    .await?;
-    let mut snapshot = HashMap::new();
-    for row in rows {
-        let key: String = get(&row, "key", "fetch_orchestration_item")?;
-        let value: String = get(&row, "value", "fetch_orchestration_item")?;
-        let last_updated_at_ms: i64 = get(&row, "last_updated_at_ms", "fetch_orchestration_item")?;
-        snapshot.insert(
-            key,
-            KvEntry {
-                value,
-                last_updated_at_ms: last_updated_at_ms as u64,
-            },
-        );
-    }
-    Ok(snapshot)
-}
-
 async fn latest_execution_id_on<C: ConnectionTrait>(
     conn: &C,
     instance: &str,
@@ -1423,7 +1315,7 @@ fn work_item_instance(item: &WorkItem) -> Option<&str> {
     }
 }
 
-async fn query_one<C: ConnectionTrait>(
+pub(crate) async fn query_one<C: ConnectionTrait>(
     conn: &C,
     sql: &str,
     values: Vec<Value>,
@@ -1434,7 +1326,7 @@ async fn query_one<C: ConnectionTrait>(
         .map_err(|e| db_error(operation, e))
 }
 
-async fn query_all<C: ConnectionTrait>(
+pub(crate) async fn query_all<C: ConnectionTrait>(
     conn: &C,
     sql: &str,
     values: Vec<Value>,
@@ -1445,7 +1337,7 @@ async fn query_all<C: ConnectionTrait>(
         .map_err(|e| db_error(operation, e))
 }
 
-async fn execute<C: ConnectionTrait>(
+pub(crate) async fn execute<C: ConnectionTrait>(
     conn: &C,
     sql: &str,
     values: Vec<Value>,
@@ -1490,7 +1382,11 @@ fn placeholders(backend: DatabaseBackend, start_index: usize, count: usize) -> S
         .join(", ")
 }
 
-fn get<T>(row: &QueryResult, column: &str, operation: &'static str) -> Result<T, ProviderError>
+pub(crate) fn get<T>(
+    row: &QueryResult,
+    column: &str,
+    operation: &'static str,
+) -> Result<T, ProviderError>
 where
     T: sea_orm::TryGetable,
 {
@@ -1499,7 +1395,7 @@ where
     })
 }
 
-fn get_opt<T>(
+pub(crate) fn get_opt<T>(
     row: &QueryResult,
     column: &str,
     operation: &'static str,
@@ -1575,19 +1471,19 @@ fn duration_ms(duration: Duration) -> i64 {
     duration.as_millis().min(i64::MAX as u128) as i64
 }
 
-fn v_str(value: impl AsRef<str>) -> Value {
+pub(crate) fn v_str(value: impl AsRef<str>) -> Value {
     Value::String(Some(Box::new(value.as_ref().to_string())))
 }
 
-fn v_opt_str(value: Option<&str>) -> Value {
+pub(crate) fn v_opt_str(value: Option<&str>) -> Value {
     Value::String(value.map(|value| Box::new(value.to_string())))
 }
 
-fn v_i64(value: i64) -> Value {
+pub(crate) fn v_i64(value: i64) -> Value {
     Value::BigInt(Some(value))
 }
 
-fn v_u64(value: u64) -> Value {
+pub(crate) fn v_u64(value: u64) -> Value {
     Value::BigInt(Some(value.min(i64::MAX as u64) as i64))
 }
 

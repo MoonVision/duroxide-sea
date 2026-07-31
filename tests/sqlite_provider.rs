@@ -2,7 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use duroxide::provider_validations::{
-    ProviderFactory, test_instance_creation_via_metadata, test_worker_item_immediate_visibility,
+    ProviderFactory,
+    kv_store::{
+        test_kv_delta_clear_all_tombstones_store, test_kv_delta_client_reads_merged,
+        test_kv_delta_snapshot_excludes_current_execution,
+        test_kv_delta_snapshot_includes_completed_execution,
+        test_kv_delta_tombstone_overrides_store,
+    },
+    test_get_instance_stats_kv_delta_only, test_get_instance_stats_kv_merged,
+    test_instance_creation_via_metadata, test_worker_item_immediate_visibility,
     test_worker_peek_lock_semantics,
 };
 use duroxide::providers::{ExecutionMetadata, Provider, WorkItem};
@@ -66,6 +74,41 @@ async fn provider_validation_worker_peek_lock_semantics() {
 #[tokio::test]
 async fn provider_validation_instance_creation_via_metadata() {
     test_instance_creation_via_metadata(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_snapshot_excludes_current_execution_delta() {
+    test_kv_delta_snapshot_excludes_current_execution(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_snapshot_includes_completed_execution() {
+    test_kv_delta_snapshot_includes_completed_execution(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_client_reads_merged_state() {
+    test_kv_delta_client_reads_merged(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_tombstone_overrides_stored_value() {
+    test_kv_delta_tombstone_overrides_store(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_clear_all_tombstones_stored_values() {
+    test_kv_delta_clear_all_tombstones_store(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_stats_include_delta_only_values() {
+    test_get_instance_stats_kv_delta_only(&SeaSqliteFactory).await;
+}
+
+#[tokio::test]
+async fn provider_validation_kv_stats_merge_store_and_delta() {
+    test_get_instance_stats_kv_merged(&SeaSqliteFactory).await;
 }
 
 #[tokio::test]

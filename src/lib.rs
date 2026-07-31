@@ -13,6 +13,7 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_literal_bound)]
 
+mod kv_store;
 pub mod migration;
 mod provider;
 
