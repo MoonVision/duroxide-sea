@@ -1337,7 +1337,7 @@ pub(crate) async fn query_one<C: ConnectionTrait>(
     values: Vec<Value>,
     operation: &'static str,
 ) -> Result<Option<QueryResult>, ProviderError> {
-    conn.query_one(statement(conn.get_database_backend(), sql, values))
+    conn.query_one_raw(statement(conn.get_database_backend(), sql, values))
         .await
         .map_err(|e| db_error(operation, e))
 }
@@ -1348,7 +1348,7 @@ pub(crate) async fn query_all<C: ConnectionTrait>(
     values: Vec<Value>,
     operation: &'static str,
 ) -> Result<Vec<QueryResult>, ProviderError> {
-    conn.query_all(statement(conn.get_database_backend(), sql, values))
+    conn.query_all_raw(statement(conn.get_database_backend(), sql, values))
         .await
         .map_err(|e| db_error(operation, e))
 }
@@ -1359,7 +1359,7 @@ pub(crate) async fn execute<C: ConnectionTrait>(
     values: Vec<Value>,
     operation: &'static str,
 ) -> Result<u64, ProviderError> {
-    conn.execute(statement(conn.get_database_backend(), sql, values))
+    conn.execute_raw(statement(conn.get_database_backend(), sql, values))
         .await
         .map(|result| result.rows_affected())
         .map_err(|e| db_error(operation, e))
@@ -1492,11 +1492,11 @@ pub(crate) fn v_str(value: impl AsRef<str>) -> Value {
 }
 
 pub(crate) fn v_owned_str(value: String) -> Value {
-    Value::String(Some(Box::new(value)))
+    Value::String(Some(value))
 }
 
 pub(crate) fn v_opt_str(value: Option<&str>) -> Value {
-    Value::String(value.map(|value| Box::new(value.to_string())))
+    Value::String(value.map(str::to_owned))
 }
 
 pub(crate) fn v_i64(value: i64) -> Value {

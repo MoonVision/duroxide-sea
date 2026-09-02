@@ -129,6 +129,12 @@ pub(crate) async fn stats<C: ConnectionTrait>(
     let value_length = match conn.get_database_backend() {
         DatabaseBackend::Sqlite => "LENGTH(CAST(value AS BLOB))",
         DatabaseBackend::Postgres | DatabaseBackend::MySql => "OCTET_LENGTH(value)",
+        _ => {
+            return Err(ProviderError::permanent(
+                "get_instance_stats",
+                "Unsupported database backend",
+            ));
+        }
     };
     let sql = format!(
         "WITH input(instance_id) AS (SELECT ?),

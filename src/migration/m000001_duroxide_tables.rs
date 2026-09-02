@@ -10,8 +10,8 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         let backend = db.get_database_backend();
 
-        for sql in create_sql(backend) {
-            db.execute(Statement::from_string(backend, sql)).await?;
+        for sql in create_sql(backend)? {
+            db.execute_raw(Statement::from_string(backend, sql)).await?;
         }
 
         Ok(())
@@ -31,7 +31,7 @@ impl MigrationTrait for Migration {
             "duroxide_executions",
             "duroxide_instances",
         ] {
-            db.execute(Statement::from_string(
+            db.execute_raw(Statement::from_string(
                 backend,
                 format!("DROP TABLE IF EXISTS {table}"),
             ))
@@ -42,12 +42,12 @@ impl MigrationTrait for Migration {
     }
 }
 
-fn create_sql(backend: DatabaseBackend) -> Vec<String> {
-    match backend {
+fn create_sql(backend: DatabaseBackend) -> Result<Vec<String>, DbErr> {
+    Ok(match backend {
         DatabaseBackend::Sqlite => sqlite_create_sql(),
         DatabaseBackend::Postgres => postgres_create_sql(),
-        DatabaseBackend::MySql => sqlite_create_sql(),
-    }
+        _ => return Err(DbErr::Custom("unsupported database backend".to_owned())),
+    })
 }
 
 fn sqlite_create_sql() -> Vec<String> {

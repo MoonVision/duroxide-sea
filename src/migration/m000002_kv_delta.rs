@@ -10,8 +10,8 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         let backend = db.get_database_backend();
 
-        for sql in up_sql(backend) {
-            db.execute(Statement::from_string(backend, sql)).await?;
+        for sql in up_sql(backend)? {
+            db.execute_raw(Statement::from_string(backend, sql)).await?;
         }
 
         Ok(())
@@ -21,16 +21,16 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         let backend = db.get_database_backend();
 
-        for sql in down_sql(backend) {
-            db.execute(Statement::from_string(backend, sql)).await?;
+        for sql in down_sql(backend)? {
+            db.execute_raw(Statement::from_string(backend, sql)).await?;
         }
 
         Ok(())
     }
 }
 
-fn up_sql(backend: DatabaseBackend) -> Vec<String> {
-    match backend {
+fn up_sql(backend: DatabaseBackend) -> Result<Vec<String>, DbErr> {
+    Ok(match backend {
         DatabaseBackend::Sqlite => vec![
             r#"
             CREATE TABLE IF NOT EXISTS duroxide_kv_delta (
@@ -69,22 +69,24 @@ fn up_sql(backend: DatabaseBackend) -> Vec<String> {
             "#,
             "ALTER TABLE duroxide_kv_store DROP COLUMN execution_id",
         ],
+        _ => return Err(DbErr::Custom("unsupported database backend".to_owned())),
     }
     .into_iter()
     .map(str::to_string)
-    .collect()
+    .collect())
 }
 
-fn down_sql(backend: DatabaseBackend) -> Vec<String> {
+fn down_sql(backend: DatabaseBackend) -> Result<Vec<String>, DbErr> {
     let execution_id_type = match backend {
         DatabaseBackend::Sqlite => "INTEGER",
         DatabaseBackend::Postgres | DatabaseBackend::MySql => "BIGINT",
+        _ => return Err(DbErr::Custom("unsupported database backend".to_owned())),
     };
 
-    vec![
+    Ok(vec![
         format!(
             "ALTER TABLE duroxide_kv_store ADD COLUMN execution_id {execution_id_type} NOT NULL DEFAULT 1"
         ),
         "DROP TABLE IF EXISTS duroxide_kv_delta".to_string(),
-    ]
+    ])
 }

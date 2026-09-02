@@ -48,7 +48,7 @@ impl ProviderFactory for SharedSeaSqliteFactory {
 
     async fn corrupt_instance_history(&self, instance: &str) {
         self.db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "UPDATE duroxide_history SET event_data = 'NOT_VALID_JSON{{{' WHERE instance_id = ?",
                 [instance.into()],
@@ -60,7 +60,7 @@ impl ProviderFactory for SharedSeaSqliteFactory {
     async fn get_max_attempt_count(&self, instance: &str) -> u32 {
         let row = self
             .db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
                 "SELECT COALESCE(MAX(attempt_count), 0) AS max_attempt_count
                  FROM duroxide_orchestrator_queue
@@ -73,7 +73,7 @@ impl ProviderFactory for SharedSeaSqliteFactory {
         let count: i64 = row
             .try_get("", "max_attempt_count")
             .expect("maximum attempt count should be an integer");
-        count as u32
+        u32::try_from(count).expect("maximum attempt count should fit in a u32")
     }
 }
 
