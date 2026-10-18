@@ -204,3 +204,135 @@ async fn fetches_and_acks_worker_item_with_completion() {
         [WorkItem::ActivityCompleted { id: 7, .. }]
     ));
 }
+
+#[tokio::test]
+async fn queue_waits_release_the_only_connection_and_observe_external_writes() {
+    use duroxide::providers::TagFilter;
+    use duroxide_sea::{DuroxideSeaProvider, migration::Migrator};
+    use sea_orm::{ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
+    use std::sync::Arc;
+
+    let mut options = ConnectOptions::new(format!(
+        "sqlite:file:notify-{}?mode=memory&cache=shared",
+        uuid::Uuid::now_v7()
+    ));
+    options.max_connections(1).sqlx_logging(false);
+    let db = Database::connect(options).await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let provider = Arc::new(DuroxideSeaProvider::new(db.clone()));
+    let limit = Duration::from_secs(2);
+    let reader = provider.clone();
+    let orchestration = tokio::spawn(async move {
+        reader
+            .fetch_orchestration_item(limit, limit, None)
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(limit, db.ping())
+        .await
+        .unwrap()
+        .unwrap();
+    provider
+        .enqueue_for_orchestrator(start_item("notify"), None)
+        .await
+        .unwrap();
+    let (_, token, _) = tokio::time::timeout(limit, orchestration)
+        .await
+        .unwrap()
+        .unwrap();
+    provider
+        .ack_orchestration_item(
+            &token,
+            INITIAL_EXECUTION_ID,
+            vec![orchestration_started_event("notify")],
+            vec![],
+            vec![],
+            ExecutionMetadata {
+                orchestration_name: Some("TestWorkflow".into()),
+                orchestration_version: Some("1.0.0".into()),
+                status: Some("Running".into()),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    let reader = provider.clone();
+    let worker = tokio::spawn(async move {
+        reader
+            .fetch_work_item(limit, limit, None, &TagFilter::DefaultOnly)
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    let reader = provider.clone();
+    let orchestration = tokio::spawn(async move {
+        reader
+            .fetch_orchestration_item(limit, limit, None)
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(limit, db.ping())
+        .await
+        .unwrap()
+        .unwrap();
+    // A different provider instance has independent notifications, as another process would.
+    let external = DuroxideSeaProvider::new(db.clone());
+    external
+        .enqueue_for_worker(WorkItem::ActivityExecute {
+            instance: "notify".into(),
+            execution_id: INITIAL_EXECUTION_ID,
+            id: 7,
+            name: "activity".into(),
+            input: "{}".into(),
+            session_id: None,
+            tag: None,
+        })
+        .await
+        .unwrap();
+    let (item, token, _) = tokio::time::timeout(limit, worker).await.unwrap().unwrap();
+    assert!(matches!(item, WorkItem::ActivityExecute { id: 7, .. }));
+    provider
+        .ack_work_item(
+            &token,
+            Some(WorkItem::ActivityCompleted {
+                instance: "notify".into(),
+                execution_id: INITIAL_EXECUTION_ID,
+                id: 7,
+                result: "done".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    let (item, _, _) = tokio::time::timeout(limit, orchestration)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        item.messages.as_slice(),
+        [WorkItem::ActivityCompleted { id: 7, .. }]
+    ));
+    let started = std::time::Instant::now();
+    assert!(
+        provider
+            .fetch_work_item(
+                limit,
+                Duration::from_millis(20),
+                None,
+                &TagFilter::DefaultOnly
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(started.elapsed() < limit);
+    tokio::time::timeout(limit, db.ping())
+        .await
+        .unwrap()
+        .unwrap();
+}

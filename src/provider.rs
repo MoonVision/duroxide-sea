@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 
 use async_trait::async_trait;
 use duroxide::providers::{
@@ -9,7 +11,7 @@ use duroxide::providers::{
 use duroxide::{Event, EventKind, INITIAL_EVENT_ID, SystemStats};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, QueryResult,
-    Statement, TransactionTrait, Value,
+    SqliteTransactionMode, Statement, TransactionOptions, TransactionTrait, Value,
 };
 use uuid::Uuid;
 
@@ -18,12 +20,23 @@ use crate::kv_store;
 #[derive(Clone)]
 pub struct DuroxideSeaProvider {
     db: DatabaseConnection,
+    orchestration_ready: Arc<Notify>,
+    work_ready: Arc<Notify>,
 }
 
 impl DuroxideSeaProvider {
     #[must_use]
-    pub const fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self {
+            db,
+            orchestration_ready: Arc::default(),
+            work_ready: Arc::default(),
+        }
+    }
+
+    /// Wake local dispatchers after committing an externally managed enqueue transaction.
+    pub fn notify_orchestrator(&self) {
+        self.orchestration_ready.notify_waiters();
     }
 
     pub async fn enqueue_for_orchestrator_in_tx(
@@ -33,27 +46,18 @@ impl DuroxideSeaProvider {
     ) -> Result<(), ProviderError> {
         enqueue_orchestrator_on(txn, item, delay).await
     }
-}
 
-#[async_trait]
-impl Provider for DuroxideSeaProvider {
-    fn name(&self) -> &str {
-        "duroxide-sea"
-    }
-
-    fn version(&self) -> &str {
-        env!("CARGO_PKG_VERSION")
-    }
-
-    async fn fetch_orchestration_item(
+    async fn try_fetch_orchestration_item(
         &self,
         lock_timeout: Duration,
-        _poll_timeout: Duration,
         filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
         let txn = self
             .db
-            .begin()
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
             .await
             .map_err(|e| db_error("fetch_orchestration_item", e))?;
         let now = now_ms();
@@ -271,194 +275,18 @@ impl Provider for DuroxideSeaProvider {
         Ok(None)
     }
 
-    async fn ack_orchestration_item(
-        &self,
-        lock_token: &str,
-        execution_id: u64,
-        history_delta: Vec<Event>,
-        worker_items: Vec<WorkItem>,
-        orchestrator_items: Vec<WorkItem>,
-        metadata: ExecutionMetadata,
-        cancelled_activities: Vec<ScheduledActivityIdentifier>,
-    ) -> Result<(), ProviderError> {
-        let txn = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| db_error("ack_orchestration_item", e))?;
-        let now = now_ms();
-
-        let lock_row = query_one(
-            &txn,
-            "SELECT instance_id FROM duroxide_instance_locks WHERE lock_token = ? AND locked_until > ?",
-            vec![v_str(lock_token), v_i64(now)],
-            "ack_orchestration_item",
-        )
-        .await?
-        .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token or expired lock"))?;
-        let instance_id: String = get(&lock_row, "instance_id", "ack_orchestration_item")?;
-
-        ensure_instance_and_execution_on(&txn, &instance_id, execution_id, &metadata).await?;
-        append_history_on(&txn, &instance_id, execution_id, &history_delta).await?;
-        apply_metadata_on(&txn, &instance_id, execution_id, &metadata).await?;
-        apply_custom_status_on(&txn, &instance_id, &history_delta).await?;
-        kv_store::apply_events(
-            &txn,
-            &instance_id,
-            history_delta,
-            metadata.status.as_deref(),
-        )
-        .await?;
-
-        for item in worker_items {
-            enqueue_worker_on(&txn, item).await?;
-        }
-
-        for item in orchestrator_items {
-            enqueue_orchestrator_on(&txn, item, None).await?;
-        }
-
-        for cancelled in cancelled_activities {
-            execute(
-                &txn,
-                "DELETE FROM duroxide_worker_queue
-                 WHERE instance_id = ? AND execution_id = ? AND activity_id = ?",
-                vec![
-                    v_str(cancelled.instance),
-                    v_u64(cancelled.execution_id),
-                    v_u64(cancelled.activity_id),
-                ],
-                "ack_orchestration_item",
-            )
-            .await?;
-        }
-
-        execute(
-            &txn,
-            "DELETE FROM duroxide_orchestrator_queue WHERE lock_token = ?",
-            vec![v_str(lock_token)],
-            "ack_orchestration_item",
-        )
-        .await?;
-        execute(
-            &txn,
-            "DELETE FROM duroxide_instance_locks WHERE lock_token = ?",
-            vec![v_str(lock_token)],
-            "ack_orchestration_item",
-        )
-        .await?;
-
-        txn.commit()
-            .await
-            .map_err(|e| db_error("ack_orchestration_item", e))?;
-        Ok(())
-    }
-
-    async fn abandon_orchestration_item(
-        &self,
-        lock_token: &str,
-        delay: Option<Duration>,
-        ignore_attempt: bool,
-    ) -> Result<(), ProviderError> {
-        let txn = self
-            .db
-            .begin()
-            .await
-            .map_err(|e| db_error("abandon_orchestration_item", e))?;
-        let visible_at = now_ms().saturating_add(delay.map_or(0, duration_ms));
-        let sql = if ignore_attempt {
-            "UPDATE duroxide_orchestrator_queue
-             SET lock_token = NULL, locked_until = NULL, visible_at = ?,
-                 attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
-             WHERE lock_token = ?"
-        } else {
-            "UPDATE duroxide_orchestrator_queue
-             SET lock_token = NULL, locked_until = NULL, visible_at = ?
-             WHERE lock_token = ?"
-        };
-        let changed = execute(
-            &txn,
-            sql,
-            vec![v_i64(visible_at), v_str(lock_token)],
-            "abandon_orchestration_item",
-        )
-        .await?;
-
-        execute(
-            &txn,
-            "DELETE FROM duroxide_instance_locks WHERE lock_token = ?",
-            vec![v_str(lock_token)],
-            "abandon_orchestration_item",
-        )
-        .await?;
-
-        txn.commit()
-            .await
-            .map_err(|e| db_error("abandon_orchestration_item", e))?;
-
-        if changed == 0 {
-            return Err(ProviderError::permanent(
-                "abandon_orchestration_item",
-                "Invalid lock token",
-            ));
-        }
-        Ok(())
-    }
-
-    async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
-        let row = query_one(
-            &self.db,
-            "SELECT current_execution_id FROM duroxide_instances WHERE instance_id = ?",
-            vec![v_str(instance)],
-            "read",
-        )
-        .await?;
-        let execution_id = if let Some(row) = row {
-            let id: i64 = get(&row, "current_execution_id", "read")?;
-            id as u64
-        } else {
-            latest_execution_id_on(&self.db, instance)
-                .await?
-                .unwrap_or(duroxide::INITIAL_EXECUTION_ID)
-        };
-        read_history_on(&self.db, instance, execution_id).await
-    }
-
-    async fn read_with_execution(
-        &self,
-        instance: &str,
-        execution_id: u64,
-    ) -> Result<Vec<Event>, ProviderError> {
-        read_history_on(&self.db, instance, execution_id).await
-    }
-
-    async fn append_with_execution(
-        &self,
-        instance: &str,
-        execution_id: u64,
-        new_events: Vec<Event>,
-    ) -> Result<(), ProviderError> {
-        append_history_on(&self.db, instance, execution_id, &new_events).await
-    }
-
-    async fn enqueue_for_worker(&self, item: WorkItem) -> Result<(), ProviderError> {
-        enqueue_worker_on(&self.db, item).await
-    }
-
-    async fn fetch_work_item(
+    async fn try_fetch_work_item(
         &self,
         lock_timeout: Duration,
-        _poll_timeout: Duration,
         session: Option<&SessionFetchConfig>,
         tag_filter: &TagFilter,
     ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
-        if matches!(tag_filter, TagFilter::None) {
-            return Ok(None);
-        }
-
         let txn = self
             .db
-            .begin()
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..Default::default()
+            })
             .await
             .map_err(|e| db_error("fetch_work_item", e))?;
         let now = now_ms();
@@ -539,6 +367,224 @@ impl Provider for DuroxideSeaProvider {
             .map_err(|e| db_error("fetch_work_item", e))?;
         Ok(None)
     }
+}
+
+#[async_trait]
+impl Provider for DuroxideSeaProvider {
+    fn name(&self) -> &str {
+        "duroxide-sea"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    async fn fetch_orchestration_item(
+        &self,
+        lock_timeout: Duration,
+        poll_timeout: Duration,
+        filter: Option<&DispatcherCapabilityFilter>,
+    ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
+        wait_for_item(&self.orchestration_ready, poll_timeout, || {
+            self.try_fetch_orchestration_item(lock_timeout, filter)
+        })
+        .await
+    }
+
+    async fn ack_orchestration_item(
+        &self,
+        lock_token: &str,
+        execution_id: u64,
+        history_delta: Vec<Event>,
+        worker_items: Vec<WorkItem>,
+        orchestrator_items: Vec<WorkItem>,
+        metadata: ExecutionMetadata,
+        cancelled_activities: Vec<ScheduledActivityIdentifier>,
+    ) -> Result<(), ProviderError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| db_error("ack_orchestration_item", e))?;
+        let now = now_ms();
+
+        let lock_row = query_one(
+            &txn,
+            "SELECT instance_id FROM duroxide_instance_locks WHERE lock_token = ? AND locked_until > ?",
+            vec![v_str(lock_token), v_i64(now)],
+            "ack_orchestration_item",
+        )
+        .await?
+        .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token or expired lock"))?;
+        let instance_id: String = get(&lock_row, "instance_id", "ack_orchestration_item")?;
+
+        ensure_instance_and_execution_on(&txn, &instance_id, execution_id, &metadata).await?;
+        append_history_on(&txn, &instance_id, execution_id, &history_delta).await?;
+        apply_metadata_on(&txn, &instance_id, execution_id, &metadata).await?;
+        apply_custom_status_on(&txn, &instance_id, &history_delta).await?;
+        kv_store::apply_events(
+            &txn,
+            &instance_id,
+            history_delta,
+            metadata.status.as_deref(),
+        )
+        .await?;
+
+        for item in worker_items {
+            enqueue_worker_on(&txn, item).await?;
+        }
+
+        for item in orchestrator_items {
+            enqueue_orchestrator_on(&txn, item, None).await?;
+        }
+
+        for cancelled in cancelled_activities {
+            execute(
+                &txn,
+                "DELETE FROM duroxide_worker_queue
+                 WHERE instance_id = ? AND execution_id = ? AND activity_id = ?",
+                vec![
+                    v_str(cancelled.instance),
+                    v_u64(cancelled.execution_id),
+                    v_u64(cancelled.activity_id),
+                ],
+                "ack_orchestration_item",
+            )
+            .await?;
+        }
+
+        execute(
+            &txn,
+            "DELETE FROM duroxide_orchestrator_queue WHERE lock_token = ?",
+            vec![v_str(lock_token)],
+            "ack_orchestration_item",
+        )
+        .await?;
+        execute(
+            &txn,
+            "DELETE FROM duroxide_instance_locks WHERE lock_token = ?",
+            vec![v_str(lock_token)],
+            "ack_orchestration_item",
+        )
+        .await?;
+
+        txn.commit()
+            .await
+            .map_err(|e| db_error("ack_orchestration_item", e))?;
+        self.notify_orchestrator();
+        self.work_ready.notify_waiters();
+        Ok(())
+    }
+
+    async fn abandon_orchestration_item(
+        &self,
+        lock_token: &str,
+        delay: Option<Duration>,
+        ignore_attempt: bool,
+    ) -> Result<(), ProviderError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| db_error("abandon_orchestration_item", e))?;
+        let visible_at = now_ms().saturating_add(delay.map_or(0, duration_ms));
+        let sql = if ignore_attempt {
+            "UPDATE duroxide_orchestrator_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?,
+                 attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
+             WHERE lock_token = ?"
+        } else {
+            "UPDATE duroxide_orchestrator_queue
+             SET lock_token = NULL, locked_until = NULL, visible_at = ?
+             WHERE lock_token = ?"
+        };
+        let changed = execute(
+            &txn,
+            sql,
+            vec![v_i64(visible_at), v_str(lock_token)],
+            "abandon_orchestration_item",
+        )
+        .await?;
+
+        execute(
+            &txn,
+            "DELETE FROM duroxide_instance_locks WHERE lock_token = ?",
+            vec![v_str(lock_token)],
+            "abandon_orchestration_item",
+        )
+        .await?;
+
+        txn.commit()
+            .await
+            .map_err(|e| db_error("abandon_orchestration_item", e))?;
+
+        if changed == 0 {
+            return Err(ProviderError::permanent(
+                "abandon_orchestration_item",
+                "Invalid lock token",
+            ));
+        }
+        self.notify_orchestrator();
+        Ok(())
+    }
+
+    async fn read(&self, instance: &str) -> Result<Vec<Event>, ProviderError> {
+        let row = query_one(
+            &self.db,
+            "SELECT current_execution_id FROM duroxide_instances WHERE instance_id = ?",
+            vec![v_str(instance)],
+            "read",
+        )
+        .await?;
+        let execution_id = if let Some(row) = row {
+            let id: i64 = get(&row, "current_execution_id", "read")?;
+            id as u64
+        } else {
+            latest_execution_id_on(&self.db, instance)
+                .await?
+                .unwrap_or(duroxide::INITIAL_EXECUTION_ID)
+        };
+        read_history_on(&self.db, instance, execution_id).await
+    }
+
+    async fn read_with_execution(
+        &self,
+        instance: &str,
+        execution_id: u64,
+    ) -> Result<Vec<Event>, ProviderError> {
+        read_history_on(&self.db, instance, execution_id).await
+    }
+
+    async fn append_with_execution(
+        &self,
+        instance: &str,
+        execution_id: u64,
+        new_events: Vec<Event>,
+    ) -> Result<(), ProviderError> {
+        append_history_on(&self.db, instance, execution_id, &new_events).await
+    }
+
+    async fn enqueue_for_worker(&self, item: WorkItem) -> Result<(), ProviderError> {
+        enqueue_worker_on(&self.db, item).await?;
+        self.work_ready.notify_waiters();
+        Ok(())
+    }
+
+    async fn fetch_work_item(
+        &self,
+        lock_timeout: Duration,
+        poll_timeout: Duration,
+        session: Option<&SessionFetchConfig>,
+        tag_filter: &TagFilter,
+    ) -> Result<Option<(WorkItem, String, u32)>, ProviderError> {
+        if matches!(tag_filter, TagFilter::None) {
+            return Ok(None);
+        }
+        wait_for_item(&self.work_ready, poll_timeout, || {
+            self.try_fetch_work_item(lock_timeout, session, tag_filter)
+        })
+        .await
+    }
 
     async fn ack_work_item(
         &self,
@@ -579,6 +625,7 @@ impl Provider for DuroxideSeaProvider {
         txn.commit()
             .await
             .map_err(|e| db_error("ack_work_item", e))?;
+        self.notify_orchestrator();
         Ok(())
     }
 
@@ -702,6 +749,7 @@ impl Provider for DuroxideSeaProvider {
             ));
         }
 
+        self.work_ready.notify_waiters();
         Ok(())
     }
 
@@ -742,7 +790,9 @@ impl Provider for DuroxideSeaProvider {
         item: WorkItem,
         delay: Option<Duration>,
     ) -> Result<(), ProviderError> {
-        enqueue_orchestrator_on(&self.db, item, delay).await
+        enqueue_orchestrator_on(&self.db, item, delay).await?;
+        self.notify_orchestrator();
+        Ok(())
     }
 
     async fn get_custom_status(
@@ -1509,4 +1559,56 @@ pub(crate) fn v_u64(value: u64) -> Value {
 
 fn v_opt_u64(value: Option<u64>) -> Value {
     Value::BigInt(value.map(|value| value.min(i64::MAX as u64) as i64))
+}
+
+async fn wait_for_item<T, F, Fut>(
+    signal: &Notify,
+    poll_timeout: Duration,
+    mut fetch: F,
+) -> Result<Option<T>, ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, ProviderError>>,
+{
+    let deadline = tokio::time::Instant::now() + poll_timeout;
+    loop {
+        let notified = signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let item = fetch().await?;
+        let now = tokio::time::Instant::now();
+        if item.is_some() || now >= deadline {
+            return Ok(item);
+        }
+        // Transactions end in fetch; this wait holds no database connection.
+        // Periodic checks also discover other processes, delayed work, and expired locks.
+        tokio::select! {
+            () = &mut notified => {},
+            () = tokio::time::sleep_until(deadline.min(now + Duration::from_millis(100))) => {},
+        }
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use std::{future::Future as _, task::Poll};
+
+    #[tokio::test]
+    async fn publication_during_an_empty_check_is_not_lost() {
+        let signal = Notify::new();
+        let mut checks = 0;
+        let waiting = wait_for_item(&signal, Duration::from_secs(60), || {
+            checks += 1;
+            signal.notify_waiters();
+            std::future::ready(Ok((checks == 2).then_some(42)))
+        });
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            let result = waiting.as_mut().poll(cx);
+            assert!(matches!(result, Poll::Ready(Ok(Some(42)))));
+            Poll::Ready(())
+        })
+        .await;
+    }
 }

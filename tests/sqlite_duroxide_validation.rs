@@ -240,27 +240,16 @@ mod polling {
     use super::*;
     use duroxide::provider_validations::long_polling as validations;
 
-    // The two long-poll waiting validations are intentionally omitted because
-    // the SQLite provider implements short polling and ignores poll_timeout.
-
     #[tokio::test]
-    async fn test_short_poll_returns_immediately() {
+    async fn test_long_poll_waits_for_timeout() {
         let provider = SeaSqliteFactory.create_provider().await;
-        validations::test_short_poll_returns_immediately(
-            &*provider,
-            SeaSqliteFactory.short_poll_threshold(),
-        )
-        .await;
+        validations::test_long_poll_waits_for_timeout(&*provider).await;
     }
 
     #[tokio::test]
-    async fn test_short_poll_work_item_returns_immediately() {
+    async fn test_long_poll_work_item_waits_for_timeout() {
         let provider = SeaSqliteFactory.create_provider().await;
-        validations::test_short_poll_work_item_returns_immediately(
-            &*provider,
-            SeaSqliteFactory.short_poll_threshold(),
-        )
-        .await;
+        validations::test_long_poll_work_item_waits_for_timeout(&*provider).await;
     }
 
     #[tokio::test]
