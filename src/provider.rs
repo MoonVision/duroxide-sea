@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 
 use async_trait::async_trait;
 use duroxide::providers::{
@@ -22,6 +22,7 @@ pub struct DuroxideSeaProvider {
     db: DatabaseConnection,
     orchestration_ready: Arc<Notify>,
     work_ready: Arc<Notify>,
+    completions: broadcast::Sender<String>,
 }
 
 impl DuroxideSeaProvider {
@@ -31,12 +32,22 @@ impl DuroxideSeaProvider {
             db,
             orchestration_ready: Arc::default(),
             work_ready: Arc::default(),
+            completions: broadcast::channel(256).0,
         }
     }
 
     /// Wake local dispatchers after committing an externally managed enqueue transaction.
     pub fn notify_orchestrator(&self) {
         self.orchestration_ready.notify_waiters();
+    }
+
+    /// Observe instance IDs after a local completion or failure commits.
+    ///
+    /// Subscribe before reading status to avoid missing a concurrent completion. Notifications
+    /// are hints: re-read persisted status on receipt or lag, and poll for external writers.
+    #[must_use]
+    pub fn subscribe_completions(&self) -> broadcast::Receiver<String> {
+        self.completions.subscribe()
     }
 
     pub async fn enqueue_for_orchestrator_in_tx(
@@ -473,6 +484,9 @@ impl Provider for DuroxideSeaProvider {
             .map_err(|e| db_error("ack_orchestration_item", e))?;
         self.notify_orchestrator();
         self.work_ready.notify_waiters();
+        if matches!(metadata.status.as_deref(), Some("Completed" | "Failed")) {
+            let _ = self.completions.send(instance_id);
+        }
         Ok(())
     }
 

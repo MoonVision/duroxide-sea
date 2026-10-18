@@ -336,3 +336,81 @@ async fn queue_waits_release_the_only_connection_and_observe_external_writes() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn completion_notifications_follow_committed_terminal_status() {
+    use sea_orm::{ConnectionTrait, Statement};
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let db = support::sqlite_database().await;
+    let provider = std::sync::Arc::new(duroxide_sea::DuroxideSeaProvider::new(db.clone()));
+    let mut first = provider.subscribe_completions();
+    let mut second = (*provider).clone().subscribe_completions();
+    for status in ["Running", "Completed", "Failed"] {
+        provider
+            .enqueue_for_orchestrator(start_item(status), None)
+            .await
+            .unwrap();
+        let (_, token, _) = provider
+            .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = ExecutionMetadata {
+            status: Some(status.into()),
+            output: Some("done".into()),
+            ..Default::default()
+        };
+        assert!(
+            provider
+                .ack_orchestration_item(
+                    "invalid-lock",
+                    INITIAL_EXECUTION_ID,
+                    vec![],
+                    vec![],
+                    vec![],
+                    metadata.clone(),
+                    vec![],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(first.try_recv(), Err(TryRecvError::Empty));
+        provider
+            .ack_orchestration_item(
+                &token,
+                INITIAL_EXECUTION_ID,
+                vec![],
+                vec![],
+                vec![],
+                metadata,
+                vec![],
+            )
+            .await
+            .unwrap();
+        if status == "Running" {
+            assert_eq!(first.try_recv(), Err(TryRecvError::Empty));
+            assert_eq!(second.try_recv(), Err(TryRecvError::Empty));
+        } else {
+            // Buffered until read, even if completion occurs between checking status and waiting.
+            assert_eq!(first.try_recv().unwrap(), status);
+            assert_eq!(second.try_recv().unwrap(), status);
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    db.get_database_backend(),
+                    "SELECT status FROM duroxide_executions WHERE instance_id = $1",
+                    [status.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<String>("", "status").unwrap(), status);
+        }
+    }
+    drop(first);
+    drop(second);
+    assert_eq!(
+        provider.subscribe_completions().try_recv(),
+        Err(TryRecvError::Empty)
+    );
+}
