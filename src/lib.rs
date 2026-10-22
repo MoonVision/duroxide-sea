@@ -18,3 +18,6 @@ pub mod migration;
 mod provider;
 
 pub use provider::DuroxideSeaProvider;
+
+/// The runtime version used by this provider.
+pub use duroxide;
