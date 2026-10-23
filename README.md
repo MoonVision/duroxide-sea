@@ -13,19 +13,15 @@ then expose prepared values to their orchestration through an application-owned 
 Preparation must preserve replay decisions from the original inputs and recorded history.
 
 The provider renews the orchestration lease while preparation awaits I/O. A preparation error
-abandons the item for redelivery. The returned `PreparedOrchestration` remains alive through the
-turn and any acknowledgement retries, and is released after acknowledgement, abandonment, or
-lease expiry observed by a subsequent fetch.
+abandons the item for redelivery. The returned opaque `Arc<dyn Send + Sync>` keeps application data
+alive through the turn and any acknowledgement retries. The provider releases it after
+acknowledgement, abandonment, or lease expiry observed by a subsequent fetch.
 
-Its async `commit` method writes staged application data through the acknowledgement's
-`DatabaseTransaction`. Application writes, workflow history, and queued activities commit atomically.
-A failed transaction can call `commit` again; retain staged data until the prepared object drops.
-External effects belong in activities, whose callbacks run on the normal async executor.
-
-Both hooks and async activities support Tokio's current-thread runtime. Orchestrations use standard
-Duroxide activities, timers, and events for durable waits.
+Activities own external effects and persist their results before returning. Preparation and
+async activities support Tokio's current-thread runtime. Orchestrations use standard Duroxide
+activities, timers, and events for durable waits.
 
 ## Verification
 
 Run `cargo test --all-features` to exercise the SQLite provider validation suite and
-current-thread preparation, atomic commit, lease renewal, activity retry, and restart tests.
+current-thread preparation, lease renewal, prepared data lifetime, activity retry, and restart tests.

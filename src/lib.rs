@@ -18,7 +18,7 @@ pub mod migration;
 mod orchestration;
 mod provider;
 
-pub use orchestration::{OrchestrationPreparation, PreparedOrchestration};
+pub use orchestration::OrchestrationPreparation;
 pub use provider::DuroxideSeaProvider;
 
 /// The runtime version used by this provider.

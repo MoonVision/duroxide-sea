@@ -1,23 +1,19 @@
 use async_trait::async_trait;
 use duroxide_sea::{
-    DuroxideSeaProvider, OrchestrationPreparation, PreparedOrchestration,
+    DuroxideSeaProvider, OrchestrationPreparation,
     duroxide::{
         BackoffStrategy, Client, Event, EventKind, INITIAL_EXECUTION_ID, OrchestrationRegistry,
         OrchestrationStatus, RetryPolicy,
-        providers::{
-            ExecutionMetadata, OrchestrationItem, Provider, ProviderError, TagFilter, WorkItem,
-        },
+        providers::{ExecutionMetadata, OrchestrationItem, Provider, ProviderError},
         runtime::{Runtime, RuntimeOptions, registry::ActivityRegistry},
     },
 };
-use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction, Statement,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -32,14 +28,11 @@ struct Preparation {
     db: DatabaseConnection,
     turns: Mutex<HashMap<String, Weak<Prepared>>>,
     calls: AtomicUsize,
-    fail_commit: Arc<AtomicBool>,
     delay: Duration,
 }
 
 struct Prepared {
-    instance: String,
     value: i32,
-    fail_commit: Arc<AtomicBool>,
 }
 
 impl Preparation {
@@ -48,7 +41,6 @@ impl Preparation {
             db,
             turns: Mutex::default(),
             calls: AtomicUsize::new(0),
-            fail_commit: Arc::new(AtomicBool::new(false)),
             delay,
         })
     }
@@ -90,7 +82,7 @@ impl OrchestrationPreparation for Preparation {
     async fn prepare(
         &self,
         item: &OrchestrationItem,
-    ) -> Result<Arc<dyn PreparedOrchestration>, ProviderError> {
+    ) -> Result<Arc<dyn Send + Sync>, ProviderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         let row = self
             .db
@@ -103,9 +95,7 @@ impl OrchestrationPreparation for Preparation {
             .unwrap();
         tokio::time::sleep(self.delay).await;
         let prepared = Arc::new(Prepared {
-            instance: item.instance.clone(),
             value: row.try_get("", "answer").unwrap(),
-            fail_commit: self.fail_commit.clone(),
         });
         self.turns
             .lock()
@@ -115,40 +105,9 @@ impl OrchestrationPreparation for Preparation {
     }
 }
 
-#[async_trait]
-impl PreparedOrchestration for Prepared {
-    async fn commit(&self, transaction: &DatabaseTransaction) -> Result<(), ProviderError> {
-        transaction
-            .execute_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "INSERT OR REPLACE INTO application_values (instance, value) VALUES (?, ?)",
-                vec![self.instance.clone().into(), self.value.into()],
-            ))
-            .await
-            .unwrap();
-        if self.fail_commit.swap(false, Ordering::Relaxed) {
-            return Err(ProviderError::retryable(
-                "application_commit",
-                "transient failure after write",
-            ));
-        }
-        Ok(())
-    }
-}
-
-async fn database() -> DatabaseConnection {
-    let db = support::sqlite_database().await;
-    db.execute_unprepared(
-        "CREATE TABLE application_values (instance TEXT PRIMARY KEY, value INTEGER NOT NULL)",
-    )
-    .await
-    .unwrap();
-    db
-}
-
 #[tokio::test]
 async fn preparation_and_activities_await_io_on_current_thread_and_recover_after_restart() {
-    let db = database().await;
+    let db = support::sqlite_database().await;
     let preparation = Preparation::new(db.clone(), Duration::from_millis(5));
     let provider =
         Arc::new(DuroxideSeaProvider::new(db.clone()).with_preparation(preparation.clone()));
@@ -156,20 +115,10 @@ async fn preparation_and_activities_await_io_on_current_thread_and_recover_after
     let activities = ActivityRegistry::builder()
         .register("Echo", {
             let attempts = attempts.clone();
-            let db = db.clone();
             move |_, input: String| {
                 let attempt = attempts.fetch_add(1, Ordering::Relaxed);
-                let db = db.clone();
                 async move {
-                    let row = db
-                        .query_one_raw(Statement::from_string(
-                            DatabaseBackend::Sqlite,
-                            "SELECT value FROM application_values WHERE instance = 'prepared'",
-                        ))
-                        .await
-                        .unwrap()
-                        .expect("application writes commit before dispatch");
-                    assert_eq!(row.try_get::<i32>("", "value").unwrap(), 42);
+                    assert_eq!(input, "42");
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     if attempt == 0 {
                         Err("transient".into())
@@ -263,15 +212,14 @@ async fn preparation_and_activities_await_io_on_current_thread_and_recover_after
 }
 
 #[tokio::test]
-async fn preparation_renews_lease_and_application_writes_commit_atomically_with_outbox() {
-    let db = database().await;
+async fn preparation_renews_lease_and_releases_data_at_turn_boundaries() {
+    let db = support::sqlite_database().await;
     let preparation = Preparation::new(db.clone(), Duration::from_millis(240));
-    preparation.fail_commit.store(true, Ordering::Relaxed);
     let provider =
         Arc::new(DuroxideSeaProvider::new(db.clone()).with_preparation(preparation.clone()));
     let client = Client::new(provider.clone());
     client
-        .start_orchestration("atomic", "Prepared", "")
+        .start_orchestration("lease", "Prepared", "")
         .await
         .unwrap();
     let fetch = tokio::spawn({
@@ -285,7 +233,7 @@ async fn preparation_renews_lease_and_application_writes_commit_atomically_with_
         }
     });
     tokio::time::sleep(Duration::from_millis(180)).await;
-    let competing = DuroxideSeaProvider::new(db.clone());
+    let competing = DuroxideSeaProvider::new(db);
     assert!(
         competing
             .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
@@ -294,13 +242,39 @@ async fn preparation_renews_lease_and_application_writes_commit_atomically_with_
             .is_none()
     );
     let (_, token, _) = fetch.await.unwrap();
+    let abandoned = preparation.turns.lock().unwrap()["lease"].clone();
+    assert_eq!(abandoned.upgrade().unwrap().value, 42);
     provider
-        .renew_orchestration_item_lock(&token, Duration::from_secs(5))
+        .abandon_orchestration_item(&token, None, false)
         .await
         .unwrap();
+    assert!(abandoned.upgrade().is_none());
+
+    let (_, token, _) = provider
+        .fetch_orchestration_item(Duration::from_millis(120), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired = preparation.turns.lock().unwrap()["lease"].clone();
+    assert!(expired.upgrade().is_some());
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    let (_, replacement, _) = provider
+        .fetch_orchestration_item(Duration::from_secs(5), Duration::ZERO, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(token, replacement);
+    assert!(expired.upgrade().is_none());
+    assert!(
+        preparation.turns.lock().unwrap()["lease"]
+            .upgrade()
+            .is_some()
+    );
+    assert_eq!(preparation.calls.load(Ordering::Relaxed), 3);
+
     let started = Event::with_event_id(
         1,
-        "atomic",
+        "lease",
         INITIAL_EXECUTION_ID,
         None,
         EventKind::OrchestrationStarted {
@@ -314,97 +288,25 @@ async fn preparation_renews_lease_and_application_writes_commit_atomically_with_
             initial_custom_status: None,
         },
     );
-    let activity = WorkItem::ActivityExecute {
-        instance: "atomic".into(),
-        execution_id: INITIAL_EXECUTION_ID,
-        id: 2,
-        name: "Echo".into(),
-        input: "42".into(),
-        session_id: None,
-        tag: None,
-    };
-    let metadata = ExecutionMetadata {
-        orchestration_name: Some("Prepared".into()),
-        orchestration_version: Some("1.0.0".into()),
-        ..Default::default()
-    };
-    let error = provider
-        .ack_orchestration_item(
-            &token,
-            INITIAL_EXECUTION_ID,
-            vec![started.clone()],
-            vec![activity.clone()],
-            vec![],
-            metadata.clone(),
-            vec![],
-        )
-        .await
-        .unwrap_err();
-    assert!(error.is_retryable());
-    assert!(provider.read("atomic").await.unwrap().is_empty());
-    assert!(
-        db.query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT value FROM application_values"
-        ))
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert!(
-        provider
-            .fetch_work_item(
-                Duration::from_secs(5),
-                Duration::ZERO,
-                None,
-                &TagFilter::DefaultOnly
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        preparation.turns.lock().unwrap()["atomic"]
-            .upgrade()
-            .is_some(),
-        "failed acknowledgement retains prepared state"
-    );
     provider
         .ack_orchestration_item(
-            &token,
+            &replacement,
             INITIAL_EXECUTION_ID,
             vec![started],
-            vec![activity],
             vec![],
-            metadata,
+            vec![],
+            ExecutionMetadata {
+                orchestration_name: Some("Prepared".into()),
+                orchestration_version: Some("1.0.0".into()),
+                ..Default::default()
+            },
             vec![],
         )
         .await
         .unwrap();
-    assert_eq!(provider.read("atomic").await.unwrap().len(), 1);
+    assert_eq!(provider.read("lease").await.unwrap().len(), 1);
     assert!(
-        db.query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "SELECT value FROM application_values"
-        ))
-        .await
-        .unwrap()
-        .is_some()
-    );
-    assert!(
-        provider
-            .fetch_work_item(
-                Duration::from_secs(5),
-                Duration::ZERO,
-                None,
-                &TagFilter::DefaultOnly
-            )
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        preparation.turns.lock().unwrap()["atomic"]
+        preparation.turns.lock().unwrap()["lease"]
             .upgrade()
             .is_none()
     );

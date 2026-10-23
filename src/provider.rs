@@ -27,10 +27,7 @@ pub struct DuroxideSeaProvider {
     prepared: Arc<Mutex<HashMap<String, PreparedTurn>>>,
 }
 
-struct PreparedTurn {
-    expires_at: i64,
-    application: Arc<dyn crate::PreparedOrchestration>,
-}
+type PreparedTurn = (i64, Arc<dyn Send + Sync>);
 
 impl DuroxideSeaProvider {
     #[must_use]
@@ -417,7 +414,7 @@ impl Provider for DuroxideSeaProvider {
         self.prepared
             .lock()
             .unwrap()
-            .retain(|_, turn| turn.expires_at > now_ms());
+            .retain(|_, (expires_at, _)| *expires_at > now_ms());
         let fetched = wait_for_item(&self.orchestration_ready, poll_timeout, || {
             self.try_fetch_orchestration_item(lock_timeout, filter)
         })
@@ -450,10 +447,10 @@ impl Provider for DuroxideSeaProvider {
             .await?;
         self.prepared.lock().unwrap().insert(
             token.clone(),
-            PreparedTurn {
-                expires_at: now_ms().saturating_add(duration_ms(lock_timeout)),
+            (
+                now_ms().saturating_add(duration_ms(lock_timeout)),
                 application,
-            },
+            ),
         );
         Ok(fetched)
     }
@@ -485,21 +482,6 @@ impl Provider for DuroxideSeaProvider {
         .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token or expired lock"))?;
         let instance_id: String = get(&lock_row, "instance_id", "ack_orchestration_item")?;
 
-        let application = self
-            .prepared
-            .lock()
-            .unwrap()
-            .get(lock_token)
-            .map(|turn| turn.application.clone());
-        if self.preparation.is_some() {
-            let application = application.ok_or_else(|| {
-                ProviderError::permanent(
-                    "ack_orchestration_item",
-                    "Prepared application state is unavailable",
-                )
-            })?;
-            application.commit(&txn).await?;
-        }
         ensure_instance_and_execution_on(&txn, &instance_id, execution_id, &metadata).await?;
         append_history_on(&txn, &instance_id, execution_id, &history_delta).await?;
         apply_metadata_on(&txn, &instance_id, execution_id, &metadata).await?;
@@ -869,8 +851,8 @@ impl Provider for DuroxideSeaProvider {
             "renew_orchestration_item_lock",
         )
         .await?;
-        if let Some(turn) = self.prepared.lock().unwrap().get_mut(token) {
-            turn.expires_at = locked_until;
+        if let Some((expires_at, _)) = self.prepared.lock().unwrap().get_mut(token) {
+            *expires_at = locked_until;
         }
         Ok(())
     }
