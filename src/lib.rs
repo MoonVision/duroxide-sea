@@ -15,8 +15,10 @@
 
 mod kv_store;
 pub mod migration;
+mod orchestration;
 mod provider;
 
+pub use orchestration::{OrchestrationPreparation, PreparedOrchestration};
 pub use provider::DuroxideSeaProvider;
 
 /// The runtime version used by this provider.

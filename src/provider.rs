@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, broadcast};
 
@@ -23,6 +23,13 @@ pub struct DuroxideSeaProvider {
     orchestration_ready: Arc<Notify>,
     work_ready: Arc<Notify>,
     completions: broadcast::Sender<String>,
+    preparation: Option<Arc<dyn crate::OrchestrationPreparation>>,
+    prepared: Arc<Mutex<HashMap<String, PreparedTurn>>>,
+}
+
+struct PreparedTurn {
+    expires_at: i64,
+    application: Arc<dyn crate::PreparedOrchestration>,
 }
 
 impl DuroxideSeaProvider {
@@ -33,7 +40,18 @@ impl DuroxideSeaProvider {
             orchestration_ready: Arc::default(),
             work_ready: Arc::default(),
             completions: broadcast::channel(256).0,
+            preparation: None,
+            prepared: Arc::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_preparation(
+        mut self,
+        preparation: Arc<dyn crate::OrchestrationPreparation>,
+    ) -> Self {
+        self.preparation = Some(preparation);
+        self
     }
 
     /// Wake local dispatchers after committing an externally managed enqueue transaction.
@@ -396,10 +414,48 @@ impl Provider for DuroxideSeaProvider {
         poll_timeout: Duration,
         filter: Option<&DispatcherCapabilityFilter>,
     ) -> Result<Option<(OrchestrationItem, String, u32)>, ProviderError> {
-        wait_for_item(&self.orchestration_ready, poll_timeout, || {
+        self.prepared
+            .lock()
+            .unwrap()
+            .retain(|_, turn| turn.expires_at > now_ms());
+        let fetched = wait_for_item(&self.orchestration_ready, poll_timeout, || {
             self.try_fetch_orchestration_item(lock_timeout, filter)
         })
-        .await
+        .await?;
+        let (Some(preparation), Some((item, token, _))) = (&self.preparation, &fetched) else {
+            return Ok(fetched);
+        };
+        let application = {
+            let prepared = preparation.prepare(item);
+            tokio::pin!(prepared);
+            let interval = (lock_timeout / 3).max(Duration::from_millis(1));
+            loop {
+                tokio::select! {
+                    result = &mut prepared => break result,
+                    () = tokio::time::sleep(interval) => {
+                        self.renew_orchestration_item_lock(token, lock_timeout).await?;
+                    }
+                }
+            }
+        };
+        let application = match application {
+            Ok(application) => application,
+            Err(error) => {
+                self.abandon_orchestration_item(token, Some(Duration::from_millis(100)), false)
+                    .await?;
+                return Err(error);
+            }
+        };
+        self.renew_orchestration_item_lock(token, lock_timeout)
+            .await?;
+        self.prepared.lock().unwrap().insert(
+            token.clone(),
+            PreparedTurn {
+                expires_at: now_ms().saturating_add(duration_ms(lock_timeout)),
+                application,
+            },
+        );
+        Ok(fetched)
     }
 
     async fn ack_orchestration_item(
@@ -429,6 +485,21 @@ impl Provider for DuroxideSeaProvider {
         .ok_or_else(|| ProviderError::permanent("ack_orchestration_item", "Invalid lock token or expired lock"))?;
         let instance_id: String = get(&lock_row, "instance_id", "ack_orchestration_item")?;
 
+        let application = self
+            .prepared
+            .lock()
+            .unwrap()
+            .get(lock_token)
+            .map(|turn| turn.application.clone());
+        if self.preparation.is_some() {
+            let application = application.ok_or_else(|| {
+                ProviderError::permanent(
+                    "ack_orchestration_item",
+                    "Prepared application state is unavailable",
+                )
+            })?;
+            application.commit(&txn).await?;
+        }
         ensure_instance_and_execution_on(&txn, &instance_id, execution_id, &metadata).await?;
         append_history_on(&txn, &instance_id, execution_id, &history_delta).await?;
         apply_metadata_on(&txn, &instance_id, execution_id, &metadata).await?;
@@ -482,6 +553,7 @@ impl Provider for DuroxideSeaProvider {
         txn.commit()
             .await
             .map_err(|e| db_error("ack_orchestration_item", e))?;
+        self.prepared.lock().unwrap().remove(lock_token);
         self.notify_orchestrator();
         self.work_ready.notify_waiters();
         if matches!(metadata.status.as_deref(), Some("Completed" | "Failed")) {
@@ -531,6 +603,7 @@ impl Provider for DuroxideSeaProvider {
         txn.commit()
             .await
             .map_err(|e| db_error("abandon_orchestration_item", e))?;
+        self.prepared.lock().unwrap().remove(lock_token);
 
         if changed == 0 {
             return Err(ProviderError::permanent(
@@ -796,6 +869,9 @@ impl Provider for DuroxideSeaProvider {
             "renew_orchestration_item_lock",
         )
         .await?;
+        if let Some(turn) = self.prepared.lock().unwrap().get_mut(token) {
+            turn.expires_at = locked_until;
+        }
         Ok(())
     }
 

@@ -13,7 +13,7 @@ replay-version-test = ["duroxide/replay-version-test"]
 [dependencies]
 tokio = { version = "1.50.0", features = ["sync", "time"] }
 async-trait = "0.1.89"
-duroxide = { git = "https://github.com/MoonVision/duroxide", rev = "f75f27a0a8946289314bd1ed25b85827e504693b" }
+duroxide = { version = "=0.1.32" }
 sea-orm = { version = "2.0.2", features = [
     "sqlx-sqlite",
     "sqlx-postgres",
@@ -26,5 +26,5 @@ serde_json = "1"
 uuid = { version = "1.23.0", features = ["v7"] }
 
 [dev-dependencies]
-duroxide = { git = "https://github.com/MoonVision/duroxide", rev = "f75f27a0a8946289314bd1ed25b85827e504693b", features = ["provider-test"] }
+duroxide = { version = "=0.1.32", features = ["provider-test"] }
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
