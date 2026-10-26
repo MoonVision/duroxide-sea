@@ -25,3 +25,7 @@ activities, timers, and events for durable waits.
 
 Run `cargo test --all-features` to exercise the SQLite provider validation suite and
 current-thread preparation, lease renewal, prepared data lifetime, activity retry, and restart tests.
+
+With a disposable PostgreSQL database, run
+`TEST_POSTGRES_URL=postgres://localhost/duroxide_test cargo test --test postgres_sessions -- --ignored`
+to verify session renewal across multiple workers and expired or idle sessions.

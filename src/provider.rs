@@ -749,7 +749,9 @@ impl Provider for DuroxideSeaProvider {
         }
         let now = now_ms();
         let idle_cutoff = now.saturating_sub(duration_ms(idle_timeout));
-        let placeholders = placeholders(self.db.get_database_backend(), 3, owner_ids.len());
+        let placeholders = std::iter::repeat_n("?", owner_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "UPDATE duroxide_sessions
              SET locked_until = ?
@@ -1508,16 +1510,6 @@ fn normalize_placeholders(backend: DatabaseBackend, sql: &str) -> String {
         }
     }
     normalized
-}
-
-fn placeholders(backend: DatabaseBackend, start_index: usize, count: usize) -> String {
-    (0..count)
-        .map(|offset| match backend {
-            DatabaseBackend::Postgres => format!("${}", start_index + offset),
-            _ => "?".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 pub(crate) fn get<T>(
