@@ -11,20 +11,19 @@ default = []
 replay-version-test = ["duroxide/replay-version-test"]
 
 [dependencies]
-tokio = { version = "1.50.0", features = ["sync", "time"] }
-async-trait = "0.1.89"
-duroxide = { version = "=0.1.32" }
-sea-orm = { version = "2.0.2", features = [
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "sync", "time"] }
+async-trait = "0.1.92"
+duroxide = "=0.1.32"
+sea-orm = { version = "2.0.4", default-features = false, features = [
     "sqlx-sqlite",
     "sqlx-postgres",
     "runtime-tokio-rustls",
-    "macros",
 ] }
-sea-orm-migration = "2.0.2"
+sea-orm-migration = { version = "2.0.4", default-features = false }
 semver = "1"
 serde_json = "1"
-uuid = { version = "1.23.0", features = ["v7"] }
+uuid = { version = "1.29.0", features = ["v7"] }
 
 [dev-dependencies]
 duroxide = { version = "=0.1.32", features = ["provider-test"] }
-tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread"] }
